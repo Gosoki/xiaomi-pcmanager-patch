@@ -1,9 +1,9 @@
 ﻿<#
 .SYNOPSIS
-    解除小米电脑管家 6.x 控制中心的机型白名单（字幕转录、AI 降噪等）。
+    解除小米电脑管家 6.0 控制中心的机型白名单（字幕转录、AI 降噪等）。
 
 .DESCRIPTION
-    6.x 控制中心用 DeviceModelConfig.Is*Supported(model) 判断机型是否支持某功能，
+    6.0 控制中心用 DeviceModelConfig.Is*Supported(model) 判断机型是否支持某功能，
     非小米机型一律返回 false。本脚本把这些方法的 IL 改为恒返回 true。
     原版备份为同目录 XiaomiPCManager.dll.bak，可随时还原。
 
