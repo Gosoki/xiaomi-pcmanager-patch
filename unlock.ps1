@@ -1,28 +1,40 @@
 ﻿<#
 .SYNOPSIS
-    解除小米电脑管家 6.0 控制中心的机型白名单（字幕转录、AI 降噪等）。
+    小米电脑管家 6.0 补丁：解除控制中心机型白名单；可选修正小米互联的设备地区。
 
 .DESCRIPTION
-    6.0 控制中心用 DeviceModelConfig.Is*Supported(model) 判断机型是否支持某功能，
+    补丁一（默认）：6.0 控制中心用 DeviceModelConfig.Is*Supported(model) 判断机型是否支持某功能，
     非小米机型一律返回 false。本脚本把这些方法的 IL 改为恒返回 true。
-    原版备份为同目录 XiaomiPCManager.dll.bak，可随时还原。
+    补丁二（-Region）：6.0 互联服务 micont_rtm.dll 把 Windows「国家或地区」当作设备地区发给手机，
+    和手机地区不一致时，手机会丢弃电脑发来的剪贴板。本脚本让它改读
+    HKCU\Software\MI\micont\GeoOverride 的 Name，并写入 -Region 指定的值。
+    原版分别备份为同目录的 .bak，可随时还原。
 
 .EXAMPLE
-    .\unlock.ps1                  # 打补丁（默认）
+    .\unlock.ps1                  # 解除机型白名单（默认）
+    .\unlock.ps1 -Region CN       # 同时把小米互联地区固定为 CN
     .\unlock.ps1 -Action Status   # 查看状态
-    .\unlock.ps1 -Action Restore  # 还原原版
+    .\unlock.ps1 -Action Restore  # 还原全部
 #>
 param(
     [ValidateSet('Patch', 'Restore', 'Status')]
     [string]$Action = 'Patch',
     # 直接指定 XiaomiPCManager.dll，默认从注册表自动探测
     [string]$Path,
+    # 补丁二：小米互联上报的设备地区，填手机的地区（两位代码，国行手机为 CN）
+    [ValidatePattern('^[A-Za-z]{2}$')]
+    [string]$Region,
     # 内部使用：标记为提权后重新启动的实例
     [switch]$Relaunched
 )
 
 $ErrorActionPreference = 'Stop'
 $TypeName = 'DeviceModelConfig'
+$GeoOld = 'Control Panel\International\Geo'
+$GeoNew = 'Software\MI\micont\GeoOverride'
+$GeoUserKey = "HKCU:\$GeoNew"
+# 服务拿不到登录用户令牌时，会回退读 SYSTEM 账户自己的 HKCU
+$GeoSystemKey = "Registry::HKEY_USERS\S-1-5-18\$GeoNew"
 
 Add-Type -TypeDefinition @'
 using System;
@@ -169,6 +181,18 @@ public static class XmDll {
         return list;
     }
 }
+
+public static class XmBytes {
+    public static List<int> FindAll(byte[] h, byte[] n) {
+        List<int> r = new List<int>();
+        for (int i = 0; i <= h.Length - n.Length; i++) {
+            int k = 0;
+            while (k < n.Length && h[i + k] == n[k]) k++;
+            if (k == n.Length) r.Add(i);
+        }
+        return r;
+    }
+}
 '@
 
 function Resolve-Dll {
@@ -230,50 +254,149 @@ function Write-WithRetry([string]$dll, [byte[]]$bytes) {
     }
 }
 
+# 补丁二：micont_rtm.dll 里地区路径字符串的状态（Original / Patched / Unknown / Missing）
+function Get-GeoPatch([string]$rtm) {
+    $g = [pscustomobject]@{ State = 'Missing'; Offset = -1; Bytes = $null }
+    if (-not (Test-Path -LiteralPath $rtm)) { return $g }
+    $g.Bytes = [IO.File]::ReadAllBytes($rtm)
+    $old = [XmBytes]::FindAll($g.Bytes, [Text.Encoding]::Unicode.GetBytes("$GeoOld`0"))
+    $new = [XmBytes]::FindAll($g.Bytes, [Text.Encoding]::Unicode.GetBytes("$GeoNew`0"))
+    if ($old.Count -eq 1 -and $new.Count -eq 0) { $g.State = 'Original'; $g.Offset = $old[0] }
+    elseif ($old.Count -eq 0 -and $new.Count -eq 1) { $g.State = 'Patched' }
+    else { $g.State = 'Unknown' }
+    return $g
+}
+
+function Show-GeoStatus([string]$rtm) {
+    $g = Get-GeoPatch $rtm
+    $state = @{ Original = '原版'; Patched = '已修改'; Unknown = '无法识别（版本可能已变）'; Missing = '未找到' }[$g.State]
+    $win = (Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\International\Geo' -ErrorAction SilentlyContinue).Name
+    $ovr = (Get-ItemProperty -Path $GeoUserKey -ErrorAction SilentlyContinue).Name
+    Write-Host "地区补丁: $rtm"
+    Write-Host "  状态: $state，Windows 国家或地区: $win，互联地区覆盖值: $(if ($ovr) { $ovr } else { '未设置' })"
+    if ($g.State -eq 'Patched' -and -not $ovr -and $Action -ne 'Restore') { Write-Warning '地区补丁已生效但没有覆盖值，请加 -Region 重新运行' }
+    return $g
+}
+
+function Set-GeoOverride([string[]]$keys, [string]$value) {
+    foreach ($k in $keys) {
+        New-Item -Path $k -Force | Out-Null
+        New-ItemProperty -Path $k -Name Name -Value $value -PropertyType String -Force | Out-Null
+    }
+}
+
+function Remove-GeoOverride([string[]]$keys) {
+    foreach ($k in $keys) {
+        Remove-Item -Path $k -Force -ErrorAction SilentlyContinue
+        $parent = Split-Path $k
+        if ((Test-Path $parent) -and -not (Get-ChildItem $parent) -and -not (Get-Item $parent).Property) { Remove-Item $parent }
+    }
+}
+
+# micont_rtm.dll 只被 micont_service 加载；服务启动时读取地区
+function Invoke-WithServiceStopped([scriptblock]$body) {
+    $svc = Get-Service micont_service -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+        Write-Host '停止小米互联服务 micont_service...'
+        Stop-Service micont_service -Force
+        Wait-Process -Name micont_service -Timeout 20 -ErrorAction SilentlyContinue
+    }
+    try { & $body }
+    finally { if ($svc) { Start-Service micont_service; Write-Host '已重新启动 micont_service' } }
+}
+
 $dll = Resolve-Dll
+$rtm = Join-Path (Split-Path $dll) 'MiSmartShare\micont_rtm.dll'
+if ($Region) { $Region = $Region.ToUpper() }
+
+# HKCU 要在提权前写：提权时如果换了管理员账户，HKCU 就不是当前用户的了
+if ($Action -eq 'Patch' -and $Region) { Set-GeoOverride @($GeoUserKey) $Region }
+if ($Action -eq 'Restore') { Remove-GeoOverride @($GeoUserKey) }
 
 if ($Action -ne 'Status' -and -not (Test-Writable (Split-Path $dll))) {
     Write-Host '需要管理员权限，正在请求提权...'
-    Start-Process powershell.exe -Verb RunAs -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
         '-Action', $Action, '-Path', "`"$dll`"", '-Relaunched')
+    if ($Region) { $argList += '-Region', $Region }
+    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
     return
 }
 
 try {
     $methods = Show-Status $dll
+    $geo = Show-GeoStatus $rtm
     switch ($Action) {
         'Patch' {
             $todo = @($methods | Where-Object { -not $_.Skip -and -not $_.Patched })
-            if (-not $todo) { Write-Host '无需修改。'; break }
-            $bak = "$dll.bak"
-            if (-not (Test-Path -LiteralPath $bak)) {
-                if ($methods | Where-Object Patched) {
-                    Write-Warning '当前文件已被部分修改且无备份，将不创建备份（还原需重装管家）'
-                } else {
-                    Copy-Item -LiteralPath $dll -Destination $bak
-                    Write-Host "已备份原版到 $bak"
+            if (-not $todo) {
+                Write-Host '机型白名单：无需修改。'
+            } else {
+                $bak = "$dll.bak"
+                if (-not (Test-Path -LiteralPath $bak)) {
+                    if ($methods | Where-Object Patched) {
+                        Write-Warning '当前文件已被部分修改且无备份，将不创建备份（还原需重装管家）'
+                    } else {
+                        Copy-Item -LiteralPath $dll -Destination $bak
+                        Write-Host "已备份原版到 $bak"
+                    }
+                }
+                $bytes = [IO.File]::ReadAllBytes($dll)
+                foreach ($m in $todo) {
+                    [Array]::Copy([XmDll]::PatchedCode($m.CodeSize), 0, $bytes, $m.CodeOffset, $m.CodeSize)
+                }
+                $restart = Stop-Manager $dll
+                Write-WithRetry $dll $bytes
+                $left = @([XmDll]::Scan([IO.File]::ReadAllBytes($dll), $TypeName) | Where-Object { -not $_.Skip -and -not $_.Patched })
+                if ($left) { throw "校验失败：$($left.Name -join ', ') 未生效" }
+                Write-Host "已解锁 $($todo.Count) 项：$($todo.Name -join ', ')" -ForegroundColor Green
+                if ($restart) { Start-Manager $dll }
+            }
+            if ($Region) {
+                switch ($geo.State) {
+                    'Original' {
+                        $bak = "$rtm.bak"
+                        if (-not (Test-Path -LiteralPath $bak)) {
+                            Copy-Item -LiteralPath $rtm -Destination $bak
+                            Write-Host "已备份原版到 $bak"
+                        }
+                        $bytes = $geo.Bytes
+                        $new = [Text.Encoding]::Unicode.GetBytes($GeoNew)
+                        $len = [Text.Encoding]::Unicode.GetByteCount($GeoOld)
+                        for ($i = 0; $i -lt $len; $i++) { $bytes[$geo.Offset + $i] = if ($i -lt $new.Length) { $new[$i] } else { 0 } }
+                        Set-GeoOverride @($GeoUserKey, $GeoSystemKey) $Region
+                        Invoke-WithServiceStopped { Write-WithRetry $rtm $bytes }
+                        if ((Get-GeoPatch $rtm).State -ne 'Patched') { throw '校验失败：地区补丁未生效' }
+                        Write-Host "已把小米互联地区固定为 $Region" -ForegroundColor Green
+                    }
+                    'Patched' {
+                        Set-GeoOverride @($GeoUserKey, $GeoSystemKey) $Region
+                        Invoke-WithServiceStopped { }
+                        Write-Host "小米互联地区覆盖值已设为 $Region" -ForegroundColor Green
+                    }
+                    default { throw "无法应用地区补丁：micont_rtm.dll $($geo.State)" }
                 }
             }
-            $bytes = [IO.File]::ReadAllBytes($dll)
-            foreach ($m in $todo) {
-                [Array]::Copy([XmDll]::PatchedCode($m.CodeSize), 0, $bytes, $m.CodeOffset, $m.CodeSize)
-            }
-            $restart = Stop-Manager $dll
-            Write-WithRetry $dll $bytes
-            $left = @([XmDll]::Scan([IO.File]::ReadAllBytes($dll), $TypeName) | Where-Object { -not $_.Skip -and -not $_.Patched })
-            if ($left) { throw "校验失败：$($left.Name -join ', ') 未生效" }
-            Write-Host "已解锁 $($todo.Count) 项：$($todo.Name -join ', ')" -ForegroundColor Green
-            if ($restart) { Start-Manager $dll }
         }
         'Restore' {
+            $done = $false
             $bak = "$dll.bak"
-            if (-not (Test-Path -LiteralPath $bak)) { throw '没有找到备份，重新安装小米电脑管家即可恢复原版' }
-            $restart = Stop-Manager $dll
-            Write-WithRetry $dll ([IO.File]::ReadAllBytes($bak))
-            Remove-Item -LiteralPath $bak
-            Write-Host '已还原原版并删除备份' -ForegroundColor Green
-            if ($restart) { Start-Manager $dll }
+            if (Test-Path -LiteralPath $bak) {
+                $restart = Stop-Manager $dll
+                Write-WithRetry $dll ([IO.File]::ReadAllBytes($bak))
+                Remove-Item -LiteralPath $bak
+                Write-Host '机型白名单：已还原原版并删除备份' -ForegroundColor Green
+                if ($restart) { Start-Manager $dll }
+                $done = $true
+            }
+            $bak = "$rtm.bak"
+            if (Test-Path -LiteralPath $bak) {
+                Invoke-WithServiceStopped { Write-WithRetry $rtm ([IO.File]::ReadAllBytes($bak)) }
+                Remove-Item -LiteralPath $bak
+                Write-Host '地区补丁：已还原原版并删除备份' -ForegroundColor Green
+                $done = $true
+            }
+            Remove-GeoOverride @($GeoUserKey, $GeoSystemKey)
+            if (-not $done) { throw '没有找到备份，重新安装小米电脑管家即可恢复原版' }
         }
     }
 } catch {
