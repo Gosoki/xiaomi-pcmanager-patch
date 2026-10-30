@@ -5,7 +5,7 @@
 | 补丁 | 什么情况需要 | 修什么 | 改动的文件 |
 |---|---|---|---|
 | 一、机型白名单（默认） | 在**非小米笔记本**上装了管家 | 控制中心点「字幕转录」提示打开失败，「AI 降噪」等按钮不显示 | `XiaomiPCManager.dll` |
-| 二、互联地区（`-Region`，可选） | Windows 的**国家或地区**和**手机的地区**不一样，比如人在日本、Windows 设成日本，用的是国行手机 | 手机复制、电脑粘贴正常，但**电脑复制、手机粘贴不行** | `MiSmartShare\micont_rtm.dll` |
+| 二、互联地区（`-Region`，可选） | Windows 的**国家或地区**和**手机的地区**不一样（跨地区使用时常见） | 手机复制、电脑粘贴正常，但**电脑复制、手机粘贴不行** | `MiSmartShare\micont_rtm.dll` |
 
 两个补丁都会备份原版，可以一键还原。补丁二和机型无关，小米笔记本遇到同样的地区问题也能用。
 
@@ -30,7 +30,6 @@
 - 6.0 的小米互联服务（`micont_service`，核心是 `micont_rtm.dll`）把注册表 `HKCU\Control Panel\International\Geo` 的 `Name` 当作电脑的设备地区，同步给手机。这个值就是 Windows 设置里的「国家或地区」。
 - 手机的跨设备剪贴板（`com.milink.service`）收到电脑的剪贴板通知后，会比较两边的地区，不一致就直接丢弃。手机日志：
   ```
-  isSameRegionWithLocal, localRegion = cn, targetRegion = jp
   peer device is not same region with this device, ignore this msg
   ```
 - 5.x 的互联服务没有这项检查，所以升级到 6.0 后才出现。手机→电脑方向不检查地区，不受影响。
@@ -82,7 +81,7 @@ powershell -ExecutionPolicy Bypass -File unlock.ps1 -Action Restore   # 全部�
 |---|---|
 | 字幕转录 | 补丁一后可用 |
 | AI 降噪、智能跟踪拾音 | 补丁一后入口出现，实际效果未充分验证 |
-| 剪贴板 电脑→手机 | 补丁二后可用（Windows 地区为日本） |
+| 剪贴板 电脑→手机 | 补丁二后可用（Windows 地区与手机地区不同） |
 | 人像居中 | **不可用**，见下文 |
 | 手机摄像头协同 | 本身不受机型和地区限制，不需要补丁 |
 
